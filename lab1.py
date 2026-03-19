@@ -1,171 +1,122 @@
 import simpy
 import random
-import statistics
 import matplotlib.pyplot as plt
 
-# Configuramos la semilla aleatoria para que sea reproducible
 random.seed(42)
 
-def ejecutar_simulacion(tiempo_fin=1000):
-    env = simpy.Environment()
+# ==========================================
+# CONFIGURACIÓN DE LA LÍNEA Y PARADAS
+# ==========================================
+# tasa_base: Minutos promedio entre la llegada de cada pasajero (menor = más gente)
+config_paradas = [
+    {'nombre': 'Francesc Macià',    't_viaje': 3, 'tasa_base': 1.5}, # Mucha demanda
+    {'nombre': 'Reina M. Cristina', 't_viaje': 2, 'tasa_base': 2.0},
+    {'nombre': 'Zona Universitària','t_viaje': 3, 'tasa_base': 2.5},
+    {'nombre': 'Hospital-TV3',      't_viaje': 5, 'tasa_base': 3.0},
+    {'nombre': 'Sant Feliu',        't_viaje': 5, 'tasa_base': 4.0},
+    {'nombre': 'Molins de Rei',     't_viaje': 3, 'tasa_base': 4.5},
+    {'nombre': 'Sant Vicenç H.',    't_viaje': 2, 'tasa_base': 6.0},
+    {'nombre': 'Cervelló',          't_viaje': 3, 'tasa_base': 8.0},
+    {'nombre': 'Vallirana',         't_viaje': 0, 'tasa_base': 10.0} # Poca demanda, fin trayecto
+]
 
-    # Variables de estado (Pasajeros esperando)
-    estado = {'gfm': 0, 'ght': 0, 'gva': 0, 'lstfm': 0}
+# ==========================================
+# MODELO DE SIMULACIÓN
+# ==========================================
+def simular_linea_completa(tiempo_fin=720): # Simulamos 12 horas (720 min)
+    env = simpy.Environment()
     
-    # Diccionario para guardar nuestras estadísticas
-    stats = {
-        'FM_entradas': 0, 'FM_tiempo_total': 0,
-        'HT_entradas': 0, 'HT_tiempo_total': 0,
-        'VA_entradas': 0, 'VA_tiempo_total': 0,
-    }
-    
-    # Lista para guardar las coordenadas del gráfico: (Tiempo, Hueco)
+    # Creamos las paradas dinámicamente
+    paradas = []
+    for conf in config_paradas:
+        paradas.append({
+            'nombre': conf['nombre'],
+            'recurso': simpy.Resource(env, capacity=1),
+            't_viaje': conf['t_viaje'],
+            'tasa_base': conf['tasa_base'],
+            'cola': 0,
+            'lst_bus': 0
+        })
+        
     datos_grafico = []
 
-    # Recursos (Paradas)
-    sfm = simpy.Resource(env, capacity=1)
-    sht = simpy.Resource(env, capacity=1)
-    sva = simpy.Resource(env, capacity=1)
-
-    # --- Generadores de pasajeros ---
-    def gen_pasajeros_fm():
+    # --- Generador de Pasajeros con DEMANDA VARIABLE (Opción A) ---
+    def gen_pasajeros(parada):
         while True:
-            yield env.timeout(random.uniform(19, 21)) # GENERATE 20,1
-            estado['gfm'] += 1
+            # Definimos Horas Punta: De 0 a 120 (mañana) y de 360 a 480 (mediodía)
+            es_hora_punta = (0 <= env.now <= 120) or (360 <= env.now <= 480)
+            
+            # En hora punta, la tasa baja a la mitad (llega el doble de gente)
+            # En hora valle, la tasa sube un 50% (llega menos gente)
+            multiplicador = 0.5 if es_hora_punta else 1.5
+            tasa_actual = parada['tasa_base'] * multiplicador
+            
+            yield env.timeout(random.expovariate(1.0 / tasa_actual))
+            parada['cola'] += 1
 
-    def gen_pasajeros_ht():
-        while True:
-            yield env.timeout(random.uniform(9, 27))  # GENERATE 18,9
-            estado['ght'] += 1
-
-    def gen_pasajeros_va():
-        while True:
-            yield env.timeout(random.uniform(14, 18)) # GENERATE 16,2
-            estado['gva'] += 1
-
-    # --- Ruta del autobús ---
+    # --- Ruta de los 5 Autobuses ---
     def autobus(id_bus):
         while True:
-            # PARADA 1: Francesc Macià
-            with sfm.request() as req:
-                yield req
-                
-                # Calculamos el hueco (tiempo desde que pasó CUALQUIER bus anterior)
-                hueco = env.now - estado['lstfm']
-                
-                # AHORA SÍ: Guardamos el dato para TODOS los autobuses, igual que en GPSS
-                if env.now > 0:
-                    datos_grafico.append((env.now, hueco))
-                
-                tiempo_embarque = estado['gfm']
-                estado['lstfm'] = env.now
-                estado['gfm'] = 0
-                
-                yield env.timeout(tiempo_embarque)
-                stats['FM_entradas'] += 1
-                stats['FM_tiempo_total'] += tiempo_embarque
+            for i, parada in enumerate(paradas):
+                with parada['recurso'].request() as req:
+                    yield req
+                    
+                    # Registramos el bus bunching SOLO en Francesc Macià para tener un gráfico claro
+                    if parada['nombre'] == 'Francesc Macià':
+                        hueco = env.now - parada['lst_bus']
+                        if env.now > 20: # Ignoramos el arranque inicial
+                            datos_grafico.append((env.now, hueco))
+                        parada['lst_bus'] = env.now
 
-            yield env.timeout(5) # Viaje a HTV
-
-            # PARADA 2: Hospital-TV3
-            with sht.request() as req:
-                yield req
-                tiempo_embarque = estado['ght']
-                estado['ght'] = 0
-                yield env.timeout(tiempo_embarque)
-                stats['HT_entradas'] += 1
-                stats['HT_tiempo_total'] += tiempo_embarque
-
-            yield env.timeout(10) # Viaje a VAL
-
-            # PARADA 3: Vallirana
-            with sva.request() as req:
-                yield req
-                tiempo_embarque = estado['gva']
-                estado['gva'] = 0
-                yield env.timeout(tiempo_embarque)
-                stats['VA_entradas'] += 1
-                stats['VA_tiempo_total'] += tiempo_embarque
+                    # Embarque: asumimos 0.2 minutos (12 seg) por persona
+                    tiempo_embarque = parada['cola'] * 0.2
+                    parada['cola'] = 0
+                    yield env.timeout(tiempo_embarque)
+                
+                # Viaje a la siguiente parada (con pequeña variación de tráfico)
+                if parada['t_viaje'] > 0:
+                    yield env.timeout(max(0, random.normalvariate(parada['t_viaje'], 0.5)))
             
-            # GOTO QFM (Regreso instantáneo)
+            # Al llegar a Vallirana, el bus hace un viaje de vuelta a Barcelona vacío (30 mins)
+            yield env.timeout(30)
 
-    # --- Generador de Autobuses ---
-    def gen_buses():
-        env.process(autobus(1))
-        yield env.timeout(10) # Separación inicial
-        env.process(autobus(2))
+    # --- Inicialización ---
+    for p in paradas:
+        env.process(gen_pasajeros(p))
 
-    # Arrancamos procesos
-    env.process(gen_pasajeros_fm())
-    env.process(gen_pasajeros_ht())
-    env.process(gen_pasajeros_va())
-    env.process(gen_buses())
+    # Lanzamos los 5 autobuses separados por 15 minutos iniciales
+    def despachar_flota():
+        for i in range(5):
+            env.process(autobus(i+1))
+            yield env.timeout(15)
+            
+    env.process(despachar_flota())
 
+    print("Simulando línea completa con Demanda Variable...")
     env.run(until=tiempo_fin)
-    
-    # Calcular métricas finales de esta simulación
-    metrics = {
-        'FM_utilizacion': (stats['FM_tiempo_total'] / tiempo_fin) * 100,
-        'HT_utilizacion': (stats['HT_tiempo_total'] / tiempo_fin) * 100,
-        'VA_utilizacion': (stats['VA_tiempo_total'] / tiempo_fin) * 100,
-        'FM_avg_time': stats['FM_tiempo_total'] / stats['FM_entradas'] if stats['FM_entradas'] > 0 else 0,
-        'HT_avg_time': stats['HT_tiempo_total'] / stats['HT_entradas'] if stats['HT_entradas'] > 0 else 0,
-        'VA_avg_time': stats['VA_tiempo_total'] / stats['VA_entradas'] if stats['VA_entradas'] > 0 else 0,
-        'FM_entradas': stats['FM_entradas'],
-        'HT_entradas': stats['HT_entradas'],
-        'VA_entradas': stats['VA_entradas']
-    }
-    return metrics, datos_grafico
+    return datos_grafico
 
 # ==========================================
-# 1. EJECUCIÓN MÚLTIPLE (Estadísticas N=10)
+# EJECUCIÓN Y GRÁFICO
 # ==========================================
-print("Ejecutando simulación 10 veces para Validacion Cruzada...")
-resultados_metricas = []
-datos_grafico_ejemplo = None
+datos = simular_linea_completa(720) # 12 horas de servicio
 
-for i in range(10):
-    metricas, grafico = ejecutar_simulacion()
-    resultados_metricas.append(metricas)
-    if i == 0:
-        datos_grafico_ejemplo = grafico
+tiempos = [p[0] for p in datos]
+huecos = [p[1] for p in datos]
 
-promedios = {k: statistics.mean([res[k] for res in resultados_metricas]) for k in resultados_metricas[0].keys()}
+plt.figure(figsize=(12, 6))
+plt.plot(tiempos, huecos, linestyle='-', marker='o', color='blue', markersize=3, alpha=0.7)
 
-print("\n=== TABLA DE COMPARACIÓN (PYTHON vs GPSS) ===")
-print("Metrica\t\t\tPython (Media N=10)\tGPSS (Tu reporte)")
-print("-" * 65)
-print(f"Entradas FM\t\t{promedios['FM_entradas']:.1f}\t\t\t114")
-print(f"Utilización FM (%)\t{promedios['FM_utilizacion']:.2f}%\t\t\t5.00%")
-print(f"Tiempo Medio FM\t\t{promedios['FM_avg_time']:.2f}\t\t\t0.44")
-print("-" * 65)
-print(f"Entradas HT\t\t{promedios['HT_entradas']:.1f}\t\t\t112")
-print(f"Utilización HT (%)\t{promedios['HT_utilizacion']:.2f}%\t\t\t5.40%")
-print(f"Tiempo Medio HT\t\t{promedios['HT_avg_time']:.2f}\t\t\t0.48")
-print("-" * 65)
-print(f"Entradas VA\t\t{promedios['VA_entradas']:.1f}\t\t\t112")
-print(f"Utilización VA (%)\t{promedios['VA_utilizacion']:.2f}%\t\t\t6.30%")
-print(f"Tiempo Medio VA\t\t{promedios['VA_avg_time']:.2f}\t\t\t0.56")
+# Pintamos franjas de fondo para destacar las HORAS PUNTA
+plt.axvspan(0, 120, color='red', alpha=0.1, label='Hora Punta (Matí)')
+plt.axvspan(360, 480, color='red', alpha=0.1, label='Hora Punta (Migdia)')
 
-# ==========================================
-# 2. GENERACIÓN DEL GRÁFICO (Bus Bunching)
-# ==========================================
-print("\nGenerando gráfico del Efecto Acordeón...")
-
-tiempos = [punto[0] for punto in datos_grafico_ejemplo]
-huecos = [punto[1] for punto in datos_grafico_ejemplo]
-
-plt.figure(figsize=(10, 5))
-
-# Usamos línea roja más fina para simular el estilo de tu GPSS
-plt.plot(tiempos, huecos, linestyle='-', color='red', linewidth=0.8)
-
-plt.title("Evolució de l'Interval entre Autobusos a la Parada FM", fontsize=14)
+plt.title("Efecte Acordió (Demanda Variable) - 5 Autobusos, 9 Parades", fontsize=14)
 plt.xlabel("Temps de simulació (minuts)", fontsize=12)
-plt.ylabel("Interval (minuts)", fontsize=12)
-
-plt.grid(True, linestyle='--', alpha=0.7)
+plt.ylabel("Interval entre autobusos a F. Macià (minuts)", fontsize=12)
+plt.axhline(y=15, color='green', linestyle='--', label='Interval Ideal (15 min)')
+plt.legend()
+plt.grid(True, linestyle='--', alpha=0.5)
 plt.ylim(bottom=0)
-
 plt.tight_layout()
 plt.show()
